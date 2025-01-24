@@ -1,0 +1,17 @@
+{
+    "models": [
+        {
+            "model_key": "deepseek_reasoner",
+            "display_name": "DeepSeek Reasoner",
+            "token_groups": [{"type": "single", "input": "input", "output": "output"}],
+            "tokens": {
+                "input": 154,
+                "output": 7441
+            },
+            "cost_per_million": {
+                "input": 0.14,
+                "output": 2.19
+            }
+        }
+    ]
+} 

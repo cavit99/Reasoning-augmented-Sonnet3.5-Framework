@@ -8,3 +8,4 @@ explore-gpqa.py
 __pycache__/
 explore-output-dataset.py
 .DS_Store
+backup/
