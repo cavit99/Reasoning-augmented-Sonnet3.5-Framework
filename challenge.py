@@ -6,7 +6,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 
 # Third-party imports
 import pandas as pd
@@ -33,6 +33,7 @@ class Config:
     DATASET_NAME: str = "iDavidRein/gpqa"
     DATASET_SPLIT: str = "train"  # Only split available in GPQA
     RESULTS_DIR: str = "benchmark_results"
+    BATCH_SIZE: int = 100  # Number of samples per HuggingFace upload
     
     # API configuration 
     DEEPSEEK_API_KEY: str = os.environ.get('DEEPSEEK_API_KEY')
@@ -51,25 +52,24 @@ class Config:
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 2
     
-    # Add HF_DATASET_REPO to Config class
+    # Dataset configuration
     HF_DATASET_REPO: str = "spawn99/GPQA-diamond-ClaudeR1"
 
-# Add these constants after the Config class
-MODEL_CONFIG = [
-    {
-        "model_key": "deepseek_reasoner",
-        "display_name": "DeepSeek Reasoner",
-        "token_groups": [{"type": "single", "input": "input", "output": "output"}]
-    },
-    {
-        "model_key": "claude_sonnet",
-        "display_name": "Claude Sonnet",
-        "token_groups": [
-            {"type": "grouped", "label": "Standalone", "input": "standalone_input", "output": "standalone_output"},
-            {"type": "grouped", "label": "With Reasoning", "input": "with_reasoning_input", "output": "with_reasoning_output"}
-        ]
-    }
-]
+class SchemaField:
+    """Combines type validation and serialization format"""
+    def __init__(self, py_type, hf_type=None):
+        self.py_type = py_type
+        self.hf_type = hf_type or self._default_hf_type(py_type)
+        
+    def _default_hf_type(self, t):
+        type_map = {
+            str: "string",
+            int: "int64",
+            float: "float64",
+            bool: "bool",
+            type(None): "null"
+        }
+        return type_map.get(t, "string")
 
 def setup_directories() -> None:
     """Create necessary directories if they don't exist."""
@@ -93,24 +93,21 @@ def get_output_paths() -> str:
     """Generate standardized output path for results."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"arc__deepseek-{Config.DEEPSEEK_MODEL}__claude-{Config.CLAUDE_MODEL}__{timestamp}"
-    jsonl_path = os.path.join(Config.RESULTS_DIR, f"{base_name}.jsonl")
-    return jsonl_path
+    return os.path.join(Config.RESULTS_DIR, f"{base_name}.jsonl")
 
 def extract_answer(text: str) -> Optional[str]:
     """Extract answer from between XML tags."""
     if not text:
         return None
     
-    # Clean and normalize input text
     text = text.strip()
     if not text:
         return None
     
-    # Check for malformed XML patterns
-    if text == '</answer>' or text == '<answer>':
+    if text in ('</answer>', '<answer>'):
         return None
     
-    pattern = r'<answer[^>]*>(.*?)</answer>'  # Modified to handle attributes
+    pattern = r'<answer[^>]*>(.*?)</answer>'
     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
     
     if not match:
@@ -136,34 +133,31 @@ class ModelRunner:
         )
         self.anthropic_client = Anthropic(api_key=Config.ANTHROPIC_API_KEY)
 
-    def get_deepseek_response(self, prompt: str) -> Tuple[str, str]:
-        """Get response from DeepSeek with retry logic."""
+    def get_deepseek_response(self, prompt: str) -> Tuple[str, str, Dict[str, int]]:
+        """Get response from DeepSeek with retry logic and token tracking."""
         for attempt in range(Config.MAX_RETRIES):
             try:
                 response = self.deepseek_client.chat.completions.create(
                     model=Config.DEEPSEEK_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True
+                    messages=[{"role": "user", "content": prompt}]
                 )
                 
-                reasoning_content = ""
-                content = ""
-                
-                for chunk in response:
-                    if chunk.choices[0].delta.reasoning_content:
-                        reasoning_content += chunk.choices[0].delta.reasoning_content
-                    if chunk.choices[0].delta.content:
-                        content += chunk.choices[0].delta.content
-                
-                return reasoning_content, content
+                return (
+                    response.choices[0].message.reasoning_content or "",
+                    response.choices[0].message.content or "",
+                    {
+                        "input": response.usage.prompt_tokens,
+                        "output": response.usage.completion_tokens
+                    }
+                )
                 
             except Exception as e:
                 if attempt == Config.MAX_RETRIES - 1:
                     raise
                 time.sleep(Config.RETRY_DELAY)
 
-    def get_claude_response(self, prompt: str) -> str:
-        """Get response from Claude with retry logic."""
+    def get_claude_response(self, prompt: str) -> Tuple[str, Dict[str, int]]:
+        """Get response from Claude with retry logic and token tracking."""
         for attempt in range(Config.MAX_RETRIES):
             try:
                 response = self.anthropic_client.messages.create(
@@ -171,23 +165,23 @@ class ModelRunner:
                     max_tokens=1024,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                return response.content[0].text
-                
+                return (
+                    response.content[0].text,
+                    {
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens
+                    }
+                )
             except Exception as e:
                 if attempt == Config.MAX_RETRIES - 1:
                     raise
                 time.sleep(Config.RETRY_DELAY)
 
 def estimate_cost(num_samples: int) -> Dict[str, Any]:
-    """Estimate API costs for running the benchmark using a data-driven approach."""
-    # Load configuration
-    config_path = "config.json"
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Missing {config_path} file")
-
-    with open(config_path, 'r') as f:
+    """Estimate API costs using config.json"""
+    with open("config.json") as f:
         config = json.load(f)
-
+    
     results = {
         "estimated_costs": {},
         "token_breakdown": {},
@@ -195,253 +189,491 @@ def estimate_cost(num_samples: int) -> Dict[str, Any]:
         "pricing_rates": {}
     }
 
-    total_cost = 0
-    total_input_tokens = 0
-    total_output_tokens = 0
+    total_cost = total_input = total_output = 0
+
+    # Initialize estimated_costs and token_breakdown for all models and groups
+    for model in config["models"]:
+        model_key = model["model_key"]
+        results["pricing_rates"][model_key] = model["cost_per_million"]
+        
+        # Handle grouped models
+        if any(g["type"] == "grouped" for g in model["token_groups"]):
+            for group in model["token_groups"]:
+                group_key = f"{model_key}_{group['label'].lower().replace(' ', '_')}"
+                results["estimated_costs"][group_key] = 0.0
+                results["token_breakdown"][group_key] = {"input": 0, "output": 0}
+        else:
+            results["estimated_costs"][model_key] = 0.0
+            results["token_breakdown"][model_key] = {"input": 0, "output": 0}
 
     for model in config["models"]:
         model_key = model["model_key"]
-        tokens = model["tokens"]
+        token_groups = model["token_groups"]
         rates = model["cost_per_million"]
-
-        model_cost = 0
-        model_tokens = {"input": 0, "output": 0}
-
-        for group in model["token_groups"]:
-            input_tokens = tokens[group["input"]]
-            output_tokens = tokens[group["output"]]
-            
-            # Calculate costs
-            input_cost = (input_tokens * rates["input"] / 1_000_000) * num_samples
-            output_cost = (output_tokens * rates["output"] / 1_000_000) * num_samples
-            model_cost += input_cost + output_cost
-
-            # Track tokens
-            model_tokens["input"] += input_tokens * num_samples
-            model_tokens["output"] += output_tokens * num_samples
-
-        total_cost += model_cost
-        total_input_tokens += model_tokens["input"]
-        total_output_tokens += model_tokens["output"]
         
-        results["estimated_costs"][model_key] = round(model_cost, 2)
-        results["token_breakdown"][model_key] = model_tokens
-        results["pricing_rates"][model_key] = rates
+        for group in token_groups:
+            if group["type"] == "grouped":
+                # Generate unique key for grouped entries
+                group_key = f"{model_key}_{group['label'].lower().replace(' ', '_')}"
+                input_key = group["input"]
+                output_key = group["output"]
+                
+                input_tokens = model["tokens"][input_key]
+                output_tokens = model["tokens"][output_key]
+                
+                # Calculate costs for this group
+                input_cost = (input_tokens * rates["input"] / 1_000_000) * num_samples
+                output_cost = (output_tokens * rates["output"] / 1_000_000) * num_samples
+                group_cost = input_cost + output_cost
+                
+                # Update group-specific entries
+                results["estimated_costs"][group_key] += round(group_cost, 2)
+                results["token_breakdown"][group_key]["input"] += input_tokens * num_samples
+                results["token_breakdown"][group_key]["output"] += output_tokens * num_samples
+                
+                total_cost += group_cost
+                total_input += input_tokens * num_samples
+                total_output += output_tokens * num_samples
+                
+            else:  # Handle single-entry models
+                input_key = group["input"]
+                output_key = group["output"]
+                
+                input_tokens = model["tokens"][input_key]
+                output_tokens = model["tokens"][output_key]
+                
+                input_cost = (input_tokens * rates["input"] / 1_000_000) * num_samples
+                output_cost = (output_tokens * rates["output"] / 1_000_000) * num_samples
+                model_cost = input_cost + output_cost
 
+                results["estimated_costs"][model_key] += round(model_cost, 2)
+                results["token_breakdown"][model_key]["input"] += input_tokens * num_samples
+                results["token_breakdown"][model_key]["output"] += output_tokens * num_samples
+                
+                total_cost += model_cost
+                total_input += input_tokens * num_samples
+                total_output += output_tokens * num_samples
+
+    # Update totals
     results["estimated_costs"]["total"] = round(total_cost, 2)
-    results["total_tokens"] = total_input_tokens + total_output_tokens
-    results["total_input_tokens"] = total_input_tokens
-    results["total_output_tokens"] = total_output_tokens
+    results["total_tokens"] = total_input + total_output
+    results["total_input_tokens"] = total_input
+    results["total_output_tokens"] = total_output
 
     return results
 
 def print_cost_estimate(estimate: Dict[str, Any]) -> None:
-    """Print cost estimate in a structured format"""
-    # Load configuration to get model display info
-    with open("config.json", 'r') as f:
+    """Print cost estimate in a structured format."""
+    with open("config.json") as f:
         config = json.load(f)
 
     print("\n=== Cost Estimate ===")
     for model in config["models"]:
-        model_key = model["model_key"]
-        cost = estimate["estimated_costs"][model_key]
-        print(f"{model['display_name']}: ${cost:.2f}")
+        if "claude" in model["model_key"].lower():
+            # Split Claude costs by group
+            for group in model["token_groups"]:
+                group_name = f"{model['display_name']} ({group['label']})"
+                cost = estimate["estimated_costs"][f"{model['model_key']}_{group['label'].lower().replace(' ', '_')}"]
+                print(f"{group_name}: ${cost:.2f}")
+        else:
+            # Regular display for non-Claude models
+            cost = estimate["estimated_costs"][model["model_key"]]
+            print(f"{model['display_name']}: ${cost:.2f}")
     
     print(f"\nTotal Cost: ${estimate['estimated_costs']['total']:.2f}")
+
+def get_processed_record_ids() -> set[str]:
+    """Get set of already processed record IDs from local JSONL files."""
+    processed_ids = set()
     
-    print("\n=== Token Breakdown ===")
-    for model in config["models"]:
-        model_key = model["model_key"]
-        tokens = estimate["token_breakdown"][model_key]
-        
-        print(f"\n{model['display_name']}:")
-        for group in model["token_groups"]:
-            if group["type"] == "grouped":
-                print(f"  {group['label']}:")
-            print(f"    Input: {tokens['input']:,}")
-            print(f"    Output: {tokens['output']:,}")
-
-    print("\n=== Totals ===")
-    print(f"Total Input Tokens: {estimate['total_input_tokens']:,}")
-    print(f"Total Output Tokens: {estimate['total_output_tokens']:,}")
-    print(f"Total Tokens: {estimate['total_tokens']:,}")
-
-def get_processed_record_ids(repo_id: str) -> set[str]:
-    """Get set of already processed record IDs efficiently."""
     try:
-        # Stream just the record_id column to handle potentially large datasets
-        dataset = load_dataset(
-            repo_id,
-            split="train",
-            streaming=True,
-            columns=["record_id"]
-        )
-        
-        processed_ids = set()
-        for batch in dataset.iter(batch_size=1000):
-            processed_ids.update(batch["record_id"])
-            
-        print(f"Loaded {len(processed_ids)} record IDs from existing dataset")
-        return processed_ids
-        
+        for fname in os.listdir(Config.RESULTS_DIR):
+            if fname.endswith('.jsonl'):
+                with open(os.path.join(Config.RESULTS_DIR, fname)) as f:
+                    for line in f:
+                        try:
+                            record = json.loads(line)
+                            if "record_id" in record:
+                                # Ensure record_id is stored as string
+                                processed_ids.add(str(record["record_id"]))
+                        except json.JSONDecodeError:
+                            continue
+    except FileNotFoundError:
+        # Results directory doesn't exist yet
+        pass
     except Exception as e:
-        print(f"No existing dataset found or error occurred: {e}")
-        return set()
+        print(f"Warning: Error reading local files: {e}")
+    
+    return processed_ids
+
+# Add this class definition before the validate_record function
+class SchemaManager:
+    @staticmethod
+    def _get_config():
+        """Load model config from JSON file"""
+        with open("config.json") as f:
+            return json.load(f)["models"]
+
+    @staticmethod
+    def get_record_schema():
+        """Central definition of the record schema"""
+        models = SchemaManager._get_config()
+        return {
+            "record_id": SchemaField(str),
+            "question": SchemaField(str),
+            "correct_answer": SchemaField(str),
+            "correct_explanation": SchemaField(str),
+            "model_responses": {
+                "type": "nested",
+                "structure": {
+                    model["model_key"]: SchemaManager.get_model_response_structure(model)
+                    for model in models
+                }
+            },
+            "metadata": {
+                "type": "nested", 
+                "structure": {
+                    "difficulty": SchemaField(str),
+                    "high_level_domain": SchemaField(str),
+                    "subdomain": SchemaField(str)
+                }
+            },
+            "token_usage": {
+                "type": "nested",
+                "structure": SchemaManager.get_token_usage_structure()
+            }
+        }
+
+    @staticmethod
+    def get_model_response_structure(model_config):
+        structure = {}
+        for group in model_config["token_groups"]:
+            if group["type"] == "grouped":
+                key = group["label"].lower().replace(" ", "_")
+                structure[key] = {
+                    "answer": SchemaField(str),
+                    "full_response": SchemaField(str),
+                    "grade": SchemaField(type(None))
+                }
+            else:
+                structure.update({
+                    "answer": SchemaField(str),
+                    "full_response": SchemaField(str),
+                    "reasoning": SchemaField(str),
+                    "grade": SchemaField(type(None))
+                })
+        return structure
+
+    @staticmethod
+    def get_token_usage_structure():
+        structure = {}
+        for model in SchemaManager._get_config():
+            for group in model["token_groups"]:
+                key = f"{model['model_key']}"
+                if group["type"] == "grouped":
+                    key += f"_{group['label'].lower().replace(' ', '_')}"
+                structure[key] = {
+                    "input": SchemaField(int),
+                    "output": SchemaField(int)
+                }
+        return structure
+
+def validate_record(record: dict) -> bool:
+    """Validate record structure using central schema."""
+    schema = SchemaManager.get_record_schema()
+    
+    def check_structure(data, schema_node):
+        if isinstance(schema_node, SchemaField):
+            return isinstance(data, schema_node.py_type)
+            
+        if isinstance(schema_node, dict):
+            if "type" in schema_node and schema_node["type"] == "nested":
+                if not isinstance(data, dict):
+                    return False
+                return all(
+                    check_structure(data.get(k), v)
+                    for k, v in schema_node["structure"].items()
+                )
+            # Handle regular dict structure
+            if not isinstance(data, dict):
+                return False
+            return all(
+                check_structure(data.get(k), v)
+                for k, v in schema_node.items()
+            )
+            
+        return False
+    
+    return check_structure(record, schema)
+
+def calculate_cost_from_tokens(tokens: Dict[str, int], model_config: dict) -> float:
+    """Calculate cost using token counts and model config rates."""
+    input_rate = model_config["cost_per_million"]["input"] / 1_000_000
+    output_rate = model_config["cost_per_million"]["output"] / 1_000_000
+    return (tokens["input"] * input_rate) + (tokens["output"] * output_rate)
+
+def process_model_response(runner: ModelRunner, model_config: dict, prompt: str) -> Tuple[dict, dict, float, dict]:
+    """Process responses for a single model configuration and calculate costs"""
+    responses = {}
+    token_usage = {}
+    total_cost = 0.0
+    costs_breakdown = {}  # Track costs by group/model
+    
+    model_key = model_config["model_key"]
+    if "deepseek" in model_key.lower():
+        # DeepSeek specific handling
+        reasoning, response, tokens = runner.get_deepseek_response(prompt)
+        responses = {
+            "answer": extract_answer(response),
+            "full_response": response,
+            "reasoning": reasoning,
+            "grade": None
+        }
+        token_usage = {model_key: tokens}
+        cost = calculate_cost_from_tokens(tokens, model_config)
+        total_cost = cost
+        costs_breakdown[model_key] = cost
+        
+    else:
+        # Claude-style handling with groups
+        for group in model_config["token_groups"]:
+            if group["type"] == "grouped":
+                key = group["label"].lower().replace(" ", "_")
+                group_key = f"{model_key}_{key}"  # Create consistent group key
+                
+                if key == "with_reasoning":
+                    reasoning, _, deepseek_tokens = runner.get_deepseek_response(prompt)
+                    modified_prompt = f"{prompt}\n\n<reasoning>{reasoning}</reasoning>"
+                    response, tokens = runner.get_claude_response(modified_prompt)
+                else:
+                    response, tokens = runner.get_claude_response(prompt)
+                
+                responses[key] = {
+                    "answer": extract_answer(response),
+                    "full_response": response,
+                    "grade": None
+                }
+                token_usage[group_key] = tokens  # Use consistent group key
+                group_cost = calculate_cost_from_tokens(tokens, model_config)
+                costs_breakdown[group_key] = group_cost  # Store cost with consistent key
+                total_cost += group_cost
+    
+    return responses, token_usage, total_cost, costs_breakdown
+
+def consolidate_jsonl_files() -> Optional[str]:
+    """Merge all JSONL files in RESULTS_DIR with deduplication and validation."""
+    seen_ids = set()
+    all_results = []
+    error_count = 0
+    
+    for fname in os.listdir(Config.RESULTS_DIR):
+        if fname.endswith('.jsonl'):
+            with open(os.path.join(Config.RESULTS_DIR, fname)) as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        record = json.loads(line)
+                        if not validate_record(record):
+                            raise ValueError("Invalid record structure")
+                            
+                        record_id = record['record_id']
+                        
+                        if record_id in seen_ids:
+                            continue
+                            
+                        seen_ids.add(record_id)
+                        all_results.append(record)
+                        
+                    except (json.JSONDecodeError, ValueError, KeyError) as e:
+                        error_count += 1
+                        print(f"Invalid record in {fname} line {line_num}: {str(e)}")
+                        continue
+    
+    if error_count > 0:
+        print(f"Skipped {error_count} invalid/malformed records during consolidation")
+    
+    if not all_results:
+        return None
+    
+    # Sort records by record_id for consistency
+    all_results.sort(key=lambda x: x['record_id'])
+    
+    consolidated_path = os.path.join(Config.RESULTS_DIR, "consolidated.jsonl")
+    with open(consolidated_path, 'w') as f:
+        for res in all_results:
+            f.write(json.dumps(res) + '\n')
+            
+    return consolidated_path
+
+def upload_to_huggingface(jsonl_path: str, num_records: int) -> None:
+    """Upload results with dynamic schema generation."""
+    from datasets import Features, Value
+    
+    def build_features(schema_node):
+        if isinstance(schema_node, SchemaField):
+            return Value(schema_node.hf_type)
+        if isinstance(schema_node, dict):
+            if "type" in schema_node and schema_node["type"] == "nested":
+                return {k: build_features(v) for k, v in schema_node["structure"].items()}
+            return {k: build_features(v) for k, v in schema_node.items()}
+        return schema_node
+    
+    schema = SchemaManager.get_record_schema()
+    features = Features(build_features(schema))
+    
+    try:
+        existing_ds = load_dataset(Config.HF_DATASET_REPO, split="train")
+    except Exception:
+        existing_ds = None
+
+    try:
+        new_ds = load_dataset('json', data_files=jsonl_path, features=features, split='train')
+        combined_ds = concatenate_datasets([existing_ds, new_ds]) if existing_ds else new_ds
+        
+        combined_ds.push_to_hub(
+            repo_id=Config.HF_DATASET_REPO,
+            token=Config.HF_TOKEN,
+            private=False,
+            commit_message=f"Add batch of {num_records} results"
+        )
+        print(f"✅ Uploaded {num_records} new records to {Config.HF_DATASET_REPO}")
+    except Exception as e:
+        print(f"❌ Upload failed: {str(e)}")
 
 def run_benchmark():
-    """Main benchmark function."""
+    """Main benchmark execution flow."""
     setup_directories()
-    
-    # Add local backup path
-    jsonl_path = get_output_paths()
-    
-    try:
-        processed_ids = get_processed_record_ids(Config.HF_DATASET_REPO)
-    except Exception as e:
-        print(f"Error checking existing dataset: {e}")
-        return
-    
-    # Load source dataset
+    processed_ids = get_processed_record_ids()
+    print(f"Found {len(processed_ids)} processed records")
+
+    # Load and filter dataset
     dataset = load_dataset(Config.DATASET_NAME, "gpqa_diamond", token=Config.HF_TOKEN)
-    data = dataset[Config.DATASET_SPLIT]
-    total_samples = len(data)
-    print(f"Total samples in dataset: {total_samples}")
+    data = [d for d in dataset[Config.DATASET_SPLIT] if d['Record ID'] not in processed_ids]
+    print(f"Found {len(data)} unprocessed records")
     
-    # Get unprocessed records first
-    unprocessed_data = [d for d in data if d['Record ID'] not in processed_ids]
-    print(f"Unprocessed samples available: {len(unprocessed_data)}")
-    
-    # If MAX_SAMPLES is set, take a random sample from UNPROCESSED data
-    if Config.MAX_SAMPLES:
-        random.seed(99)  # For reproducibility
-        if len(unprocessed_data) <= Config.MAX_SAMPLES:
-            print(f"Only {len(unprocessed_data)} unprocessed samples available")
-            num_samples = len(unprocessed_data)
-            data = unprocessed_data
-        else:
-            num_samples = Config.MAX_SAMPLES
-            data = random.sample(unprocessed_data, Config.MAX_SAMPLES)
-    else:
-        num_samples = len(unprocessed_data)
-        data = unprocessed_data
-    
-    if num_samples == 0:
-        print("All samples have been processed already!")
-        return
+    if not data:
+        print("All samples already processed! No new API calls needed.")
         
-    print(f"Will process {num_samples} samples")
-    
-    # Show cost estimate for samples to process
-    cost_estimate = estimate_cost(num_samples)
-    print_cost_estimate(cost_estimate)
-
-    # Ask for confirmation
-    response = input("\nDo you want to proceed? (y/n): ")
-    if response.lower() != 'y':
-        print("Aborting benchmark.")
+        # Optionally try to consolidate and upload existing results
+        consolidated_path = consolidate_jsonl_files()
+        if consolidated_path:
+            print("\nAttempting to upload consolidated results to HuggingFace...")
+            upload_to_huggingface(consolidated_path, len(processed_ids))
         return
 
+    # Only show cost estimate if there are new samples to process
+    if Config.MAX_SAMPLES:
+        random.seed(99)
+        data = random.sample(data, min(Config.MAX_SAMPLES, len(data)))
+        print(f"\nSelected {len(data)} samples for processing")
+    
+    cost_estimate = estimate_cost(len(data))
+    print_cost_estimate(cost_estimate)
+    if input("\nProceed? (Y/n): ").lower() not in ('', 'y'):
+        print("Aborted.")
+        return
+
+    # Initialize components
     gpqa_dataset = GPQADataset()
     runner = ModelRunner()
-    
-    # Initialize metrics
+    batch_buffer = []
+    jsonl_path = get_output_paths()
     metrics = {
-        "total_samples_processed": len(processed_ids),
+        "processed": 0,
         "errors": 0,
         "domains": {},
-        "cost_estimate": cost_estimate,
-        "timestamp": datetime.now().isoformat()
+        "start_time": datetime.now().isoformat(),
+        "costs": {
+            "deepseek_reasoner": 0.0,
+            "claude_sonnet_standalone": 0.0,  # Use consistent keys
+            "claude_sonnet_with_reasoning": 0.0,
+            "total": 0.0
+        }
     }
-    
-    success = True  # Track if all processing completed successfully
-    
-    # Main evaluation loop
+
+    # Processing loop
     for question_data in tqdm(data, total=len(data)):
         record_id = question_data['Record ID']
-        
-        if record_id in processed_ids:
-            tqdm.write(f"\nSkipping already processed record: {record_id}")
-            continue
-            
         try:
             prompt = gpqa_dataset.get_formatted_prompt(question_data)
             
-            # Get model responses
-            reasoning, r1_response = runner.get_deepseek_response(prompt)
-            claude_response = runner.get_claude_response(prompt)
-            claude_r1_response = runner.get_claude_response(
-                f"{prompt}\n\n<reasoning>{reasoning}</reasoning>"
-            )
+            responses = {}
+            token_usage = {}
+            costs = {}
+            total_cost = 0.0
             
-            # Extract answers
-            r1_answer = extract_answer(r1_response)
-            claude_answer = extract_answer(claude_response)
-            claude_r1_answer = extract_answer(claude_r1_response)
-            
-            # Create result dictionary
+            for model_config in SchemaManager._get_config():
+                model_resp, model_tokens, cost, cost_breakdown = process_model_response(
+                    runner, model_config, prompt
+                )
+                responses[model_config["model_key"]] = model_resp
+                token_usage.update(model_tokens)
+                costs.update(cost_breakdown)
+                total_cost += cost
+                
+                # Update metrics using consistent keys
+                if "deepseek" in model_config["model_key"].lower():
+                    metrics["costs"]["deepseek_reasoner"] += cost
+                else:
+                    for group_key, group_cost in cost_breakdown.items():
+                        metrics["costs"][group_key] += group_cost
+                metrics["costs"]["total"] += cost
+
             result = {
-                "record_id": record_id,
+                "record_id": str(record_id),
                 "question": question_data['Question'],
                 "correct_answer": question_data['Correct Answer'],
                 "correct_explanation": question_data['Explanation'],
-                "model_responses": {
-                    "deepseek": {
-                        "full_response": r1_response,
-                        "answer": r1_answer,
-                        "reasoning": reasoning,
-                        "grade": None
-                    },
-                    "claude": {
-                        "standalone": {
-                            "full_response": claude_response,
-                            "answer": claude_answer,
-                            "grade": None
-                        },
-                        "with_reasoning": {
-                            "full_response": claude_r1_response,
-                            "answer": claude_r1_answer,
-                            "grade": None
-                        }
-                    }
-                },
+                "model_responses": responses,
                 "metadata": {
-                    "subdomain": question_data['High-level domain'],
-                    "high_level_domain": question_data['High-level domain'],
-                    "difficulty": question_data["Writer's Difficulty Estimate"]
+                    "difficulty": question_data.get("Writer's Difficulty Estimate", "unknown"),
+                    "high_level_domain": question_data["High-level domain"],
+                    "subdomain": question_data.get("Subdomain", "unknown")
+                },
+                "token_usage": token_usage,
+                "costs": {
+                    **costs,  # Individual model/group costs
+                    "total": total_cost  # Total cost for this record
                 }
             }
-            
-            # Append single result to JSONL file
+
+            # Update local storage and metrics
             with open(jsonl_path, 'a') as f:
                 f.write(json.dumps(result) + '\n')
             
+            metrics["processed"] += 1
+            domain = question_data['High-level domain']
+            metrics["domains"][domain] = metrics["domains"].get(domain, 0) + 1
+            
+            # Batch upload handling
+            batch_buffer.append(result)
+            if len(batch_buffer) >= Config.BATCH_SIZE:
+                upload_to_huggingface(jsonl_path, len(batch_buffer))
+                batch_buffer = []
+
         except Exception as e:
             metrics["errors"] += 1
-            tqdm.write(f"\nError processing example {record_id}: {str(e)}")
-            success = False
-            continue
-    
-    # After all processing, upload entire dataset to HuggingFace
-    if success:
-        try:
-            print("\nUploading complete dataset to HuggingFace...")
-            dataset = load_dataset('json', data_files=jsonl_path)
-            dataset.push_to_hub(
-                repo_id=Config.HF_DATASET_REPO,
-                token=Config.HF_TOKEN,
-                private=False,
-                commit_message=f"Add batch of {len(data)} results"
-            )
-            print(f"✅ Successfully uploaded dataset to {Config.HF_DATASET_REPO}")
-        except Exception as e:
-            print(f"❌ Failed to upload to HuggingFace: {str(e)}")
-            print(f"💾 Data saved locally to {jsonl_path}")
-    
-    print(f"\n✅ Benchmark completed!")
-    print(f"💾 Results saved locally to: {jsonl_path}")
-    print(f"\n📊 Processed {metrics['total_samples_processed']} samples")
+            tqdm.write(f"Error processing {record_id}: {str(e)}")
+
+    # Final upload of remaining records
+    if batch_buffer:
+        upload_to_huggingface(jsonl_path, len(batch_buffer))
+
+    # Consolidate results and final upload
+    consolidated_path = consolidate_jsonl_files()
+    if consolidated_path:
+        upload_to_huggingface(consolidated_path, metrics["processed"])
+
+    # Print final report with costs
+    print(f"\n🎯 Benchmark Complete")
+    print(f"📦 Processed: {metrics['processed']}")
     print(f"❌ Errors: {metrics['errors']}")
-    print("\n🌍 Samples by domain:")
+    print(f"⏱️ Duration: {datetime.now() - datetime.fromisoformat(metrics['start_time'])}")
+    print("\n💰 Actual Costs:")
+    print(f"  DeepSeek Total: ${metrics['costs']['deepseek_reasoner']:.4f}")
+    print(f"  Claude Standalone: ${metrics['costs']['claude_sonnet_standalone']:.4f}")
+    print(f"  Claude with Reasoning: ${metrics['costs']['claude_sonnet_with_reasoning']:.4f}")
+    print(f"  Total Cost: ${metrics['costs']['total']:.4f}")
+    print("\n🌍 Domain Distribution:")
     for domain, count in metrics["domains"].items():
         print(f"  - {domain}: {count}")
 

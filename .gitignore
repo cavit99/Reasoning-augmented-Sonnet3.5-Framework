@@ -6,3 +6,5 @@ benchmark_results/
 explore-gpqa.py
 .venv/
 __pycache__/
+explore-output-dataset.py
+.DS_Store
