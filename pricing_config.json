@@ -1,0 +1,24 @@
+{
+    "deepseek_reasoner": {
+        "tokens": {
+            "input": 108,
+            "output": 515
+        },
+        "cost_per_million": {
+            "input": 0.14,
+            "output": 2.19
+        }
+    },
+    "claude_sonnet": {
+        "tokens": {
+            "standalone_input": 122,
+            "standalone_output": 260,
+            "with_reasoning_input": 545,
+            "with_reasoning_output": 239
+        },
+        "cost_per_million": {
+            "input": 3.00,
+            "output": 15.00
+        }
+    }
+}

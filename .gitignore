@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+benchmark_results/ 
+.pytest_cache/
+explore-gpqa.py
+.venv/
+__pycache__/
