@@ -6,14 +6,13 @@ import re
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 # Third-party imports
 import pandas as pd
 from anthropic import Anthropic
 from datasets import load_dataset
 from dotenv import load_dotenv
-from huggingface_hub import login
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -28,32 +27,46 @@ class Config:
         )
     
     # Load environment variables
-    load_dotenv()
+    load_dotenv(dotenv_path=ENV_FILE, override=True)
     
     MAX_SAMPLES: Optional[int] = 1  # Set to None to run on all samples
     DATASET_NAME: str = "iDavidRein/gpqa"
     DATASET_SPLIT: str = "train"  # Only split available in GPQA
     RESULTS_DIR: str = "benchmark_results"
     
-    # API configuration
-    DEEPSEEK_API_KEY: str = os.getenv('DEEPSEEK_API_KEY')
-    ANTHROPIC_API_KEY: str = os.getenv('ANTHROPIC_API_KEY')
-    HF_TOKEN: str = os.getenv('HF_TOKEN')  # Add Hugging Face token
+    # API configuration 
+    DEEPSEEK_API_KEY: str = os.environ.get('DEEPSEEK_API_KEY')
+    ANTHROPIC_API_KEY: str = os.environ.get('ANTHROPIC_API_KEY')
+    HF_TOKEN: str = os.environ.get('HF_TOKEN')
     
     # Validate API keys
     if not all([DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, HF_TOKEN]):
         raise ValueError("Missing API keys. Please check your .env file.")
     
-    # Authenticate with Hugging Face
-    login(token=HF_TOKEN)
-    
     # Model configuration
     DEEPSEEK_MODEL: str = "deepseek-reasoner"
-    CLAUDE_MODEL: str = "claude-3-5-haiku-20241022"
+    CLAUDE_MODEL: str = "claude-3-5-sonnet-20241022"
     
     # Retry configuration
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 2
+
+# Add these constants after the Config class
+MODEL_CONFIG = [
+    {
+        "model_key": "deepseek_reasoner",
+        "display_name": "DeepSeek Reasoner",
+        "token_groups": [{"type": "single", "input": "input", "output": "output"}]
+    },
+    {
+        "model_key": "claude_sonnet",
+        "display_name": "Claude Sonnet",
+        "token_groups": [
+            {"type": "grouped", "label": "Standalone", "input": "standalone_input", "output": "standalone_output"},
+            {"type": "grouped", "label": "With Reasoning", "input": "with_reasoning_input", "output": "with_reasoning_output"}
+        ]
+    }
+]
 
 def setup_directories() -> None:
     """Create necessary directories if they don't exist."""
@@ -163,6 +176,94 @@ class ModelRunner:
                     raise
                 time.sleep(Config.RETRY_DELAY)
 
+def estimate_cost(num_samples: int) -> Dict[str, Any]:
+    """Estimate API costs for running the benchmark using a data-driven approach."""
+    # Load configuration
+    config_path = "config.json"
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Missing {config_path} file")
+
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    results = {
+        "estimated_costs": {},
+        "token_breakdown": {},
+        "total_tokens": 0,
+        "pricing_rates": {}
+    }
+
+    total_cost = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for model in config["models"]:
+        model_key = model["model_key"]
+        tokens = model["tokens"]
+        rates = model["cost_per_million"]
+
+        model_cost = 0
+        model_tokens = {"input": 0, "output": 0}
+
+        for group in model["token_groups"]:
+            input_tokens = tokens[group["input"]]
+            output_tokens = tokens[group["output"]]
+            
+            # Calculate costs
+            input_cost = (input_tokens * rates["input"] / 1_000_000) * num_samples
+            output_cost = (output_tokens * rates["output"] / 1_000_000) * num_samples
+            model_cost += input_cost + output_cost
+
+            # Track tokens
+            model_tokens["input"] += input_tokens * num_samples
+            model_tokens["output"] += output_tokens * num_samples
+
+        total_cost += model_cost
+        total_input_tokens += model_tokens["input"]
+        total_output_tokens += model_tokens["output"]
+        
+        results["estimated_costs"][model_key] = round(model_cost, 2)
+        results["token_breakdown"][model_key] = model_tokens
+        results["pricing_rates"][model_key] = rates
+
+    results["estimated_costs"]["total"] = round(total_cost, 2)
+    results["total_tokens"] = total_input_tokens + total_output_tokens
+    results["total_input_tokens"] = total_input_tokens
+    results["total_output_tokens"] = total_output_tokens
+
+    return results
+
+def print_cost_estimate(estimate: Dict[str, Any]) -> None:
+    """Print cost estimate in a structured format"""
+    # Load configuration to get model display info
+    with open("config.json", 'r') as f:
+        config = json.load(f)
+
+    print("\n=== Cost Estimate ===")
+    for model in config["models"]:
+        model_key = model["model_key"]
+        cost = estimate["estimated_costs"][model_key]
+        print(f"{model['display_name']}: ${cost:.2f}")
+    
+    print(f"\nTotal Cost: ${estimate['estimated_costs']['total']:.2f}")
+    
+    print("\n=== Token Breakdown ===")
+    for model in config["models"]:
+        model_key = model["model_key"]
+        tokens = estimate["token_breakdown"][model_key]
+        
+        print(f"\n{model['display_name']}:")
+        for group in model["token_groups"]:
+            if group["type"] == "grouped":
+                print(f"  {group['label']}:")
+            print(f"    Input: {tokens['input']:,}")
+            print(f"    Output: {tokens['output']:,}")
+
+    print("\n=== Totals ===")
+    print(f"Total Input Tokens: {estimate['total_input_tokens']:,}")
+    print(f"Total Output Tokens: {estimate['total_output_tokens']:,}")
+    print(f"Total Tokens: {estimate['total_tokens']:,}")
+
 def run_benchmark():
     """Main benchmark function."""
     setup_directories()
@@ -175,7 +276,7 @@ def run_benchmark():
     
     # If MAX_SAMPLES is set, take a random sample
     if Config.MAX_SAMPLES:
-        random.seed(42)  # For reproducibility
+        random.seed(99)  # For reproducibility
         data = random.sample(list(data), Config.MAX_SAMPLES)
         num_samples = Config.MAX_SAMPLES
     else:
@@ -183,19 +284,8 @@ def run_benchmark():
     
     # Show cost estimate
     cost_estimate = estimate_cost(num_samples)
-    print("\nEstimated costs:")
-    print(f"DeepSeek Reasoner: ${cost_estimate['estimated_costs']['deepseek_reasoner']:.2f}")
-    print(f"Claude Sonnet: ${cost_estimate['estimated_costs']['claude_sonnet']:.2f}")
-    print(f"Total: ${cost_estimate['estimated_costs']['total']:.2f}")
-    print(f"\nEstimated total tokens: {cost_estimate['token_estimates']['total_tokens']:,}")
-    print("\nPricing (per 1M tokens):")
-    print("DeepSeek Reasoner:")
-    print(f"  Input: ${cost_estimate['pricing_info']['deepseek_reasoner']['input']}")
-    print(f"  Output: ${cost_estimate['pricing_info']['deepseek_reasoner']['output']}")
-    print("Claude Sonnet:")
-    print(f"  Input: ${cost_estimate['pricing_info']['claude_sonnet']['input']}")
-    print(f"  Output: ${cost_estimate['pricing_info']['claude_sonnet']['output']}")
-    
+    print_cost_estimate(cost_estimate)
+
     # Ask for confirmation
     response = input("\nDo you want to proceed? (y/n): ")
     if response.lower() != 'y':
@@ -245,7 +335,7 @@ def run_benchmark():
             result = {
                 "record_id": example['Record ID'],
                 "question": example['Question'],
-                "correct_answer": example['Correct Answer'],  # Fixed field name
+                "correct_answer": example['Correct Answer'], 
                 "r1_full_response": r1_response,
                 "r1_answer": r1_answer,
                 "claude_full_response": claude_response,
@@ -285,67 +375,6 @@ def run_benchmark():
     print("\nSamples by domain:")
     for domain, count in metrics["domains"].items():
         print(f"{domain}: {count}")
-
-def estimate_cost(num_samples: int) -> dict:
-    """Estimate API costs for running the benchmark."""
-    
-    # Load pricing configuration
-    pricing_config_path = "pricing_config.json"
-    if not os.path.exists(pricing_config_path):
-        raise FileNotFoundError(f"Missing {pricing_config_path} file")
-    
-    with open(pricing_config_path, 'r') as f:
-        pricing_config = json.load(f)
-    
-    # Extract configuration values
-    DEEPSEEK_TOKENS = pricing_config["deepseek_reasoner"]["tokens"]
-    CLAUDE_TOKENS = pricing_config["claude_sonnet"]["tokens"]
-    DEEPSEEK_REASONER_COST = pricing_config["deepseek_reasoner"]["cost_per_million"]
-    CLAUDE_SONNET_COST = pricing_config["claude_sonnet"]["cost_per_million"]
-    
-    # Calculate costs per model
-    deepseek_cost = num_samples * (
-        (DEEPSEEK_TOKENS["input"] * DEEPSEEK_REASONER_COST["input"] / 1_000_000) +
-        (DEEPSEEK_TOKENS["output"] * DEEPSEEK_REASONER_COST["output"] / 1_000_000)
-    )
-    
-    claude_cost = num_samples * (
-        # Standalone Claude costs
-        (CLAUDE_TOKENS["standalone_input"] * CLAUDE_SONNET_COST["input"] / 1_000_000) +
-        (CLAUDE_TOKENS["standalone_output"] * CLAUDE_SONNET_COST["output"] / 1_000_000) +
-        # Claude with reasoning costs
-        (CLAUDE_TOKENS["with_reasoning_input"] * CLAUDE_SONNET_COST["input"] / 1_000_000) +
-        (CLAUDE_TOKENS["with_reasoning_output"] * CLAUDE_SONNET_COST["output"] / 1_000_000)
-    )
-    
-    total_cost = deepseek_cost + claude_cost
-    
-    total_tokens = num_samples * (
-        # DeepSeek tokens
-        DEEPSEEK_TOKENS["input"] + DEEPSEEK_TOKENS["output"] +
-        # Claude standalone tokens
-        CLAUDE_TOKENS["standalone_input"] + CLAUDE_TOKENS["standalone_output"] +
-        # Claude with reasoning tokens
-        CLAUDE_TOKENS["with_reasoning_input"] + CLAUDE_TOKENS["with_reasoning_output"]
-    )
-    
-    return {
-        "num_samples": num_samples,
-        "estimated_costs": {
-            "deepseek_reasoner": round(deepseek_cost, 2),
-            "claude_sonnet": round(claude_cost, 2),
-            "total": round(total_cost, 2)
-        },
-        "token_estimates": {
-            "deepseek": DEEPSEEK_TOKENS,
-            "claude": CLAUDE_TOKENS,
-            "total_tokens": int(total_tokens)
-        },
-        "pricing_info": {
-            "deepseek_reasoner": DEEPSEEK_REASONER_COST,
-            "claude_sonnet": CLAUDE_SONNET_COST
-        }
-    }
 
 if __name__ == "__main__":
     run_benchmark()
