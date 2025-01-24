@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple, Any
 # Third-party imports
 import pandas as pd
 from anthropic import Anthropic
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, concatenate_datasets
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
@@ -50,6 +50,9 @@ class Config:
     # Retry configuration
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 2
+    
+    # Add HF_DATASET_REPO to Config class
+    HF_DATASET_REPO: str = "spawn99/GPQA-diamond-ClaudeR1"
 
 # Add these constants after the Config class
 MODEL_CONFIG = [
@@ -86,13 +89,12 @@ class GPQADataset(BaseDataset):
             "then state your final answer clearly enclosed in <answer>...</answer> XML tags."
         )
 
-def get_output_paths() -> Tuple[str, str]:
-    """Generate standardized output paths for results."""
+def get_output_paths() -> str:
+    """Generate standardized output path for results."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"arc__deepseek-{Config.DEEPSEEK_MODEL}__claude-{Config.CLAUDE_MODEL}__{timestamp}"
-    csv_path = os.path.join(Config.RESULTS_DIR, f"{base_name}.csv")
-    json_path = os.path.join(Config.RESULTS_DIR, f"{base_name}.json")
-    return csv_path, json_path
+    jsonl_path = os.path.join(Config.RESULTS_DIR, f"{base_name}.jsonl")
+    return jsonl_path
 
 def extract_answer(text: str) -> Optional[str]:
     """Extract answer from between XML tags."""
@@ -264,25 +266,72 @@ def print_cost_estimate(estimate: Dict[str, Any]) -> None:
     print(f"Total Output Tokens: {estimate['total_output_tokens']:,}")
     print(f"Total Tokens: {estimate['total_tokens']:,}")
 
+def get_processed_record_ids(repo_id: str) -> set[str]:
+    """Get set of already processed record IDs efficiently."""
+    try:
+        # Stream just the record_id column to handle potentially large datasets
+        dataset = load_dataset(
+            repo_id,
+            split="train",
+            streaming=True,
+            columns=["record_id"]
+        )
+        
+        processed_ids = set()
+        for batch in dataset.iter(batch_size=1000):
+            processed_ids.update(batch["record_id"])
+            
+        print(f"Loaded {len(processed_ids)} record IDs from existing dataset")
+        return processed_ids
+        
+    except Exception as e:
+        print(f"No existing dataset found or error occurred: {e}")
+        return set()
+
 def run_benchmark():
     """Main benchmark function."""
     setup_directories()
-    csv_path, json_path = get_output_paths()
     
-    # Load dataset
+    # Add local backup path
+    jsonl_path = get_output_paths()
+    
+    try:
+        processed_ids = get_processed_record_ids(Config.HF_DATASET_REPO)
+    except Exception as e:
+        print(f"Error checking existing dataset: {e}")
+        return
+    
+    # Load source dataset
     dataset = load_dataset(Config.DATASET_NAME, "gpqa_diamond", token=Config.HF_TOKEN)
     data = dataset[Config.DATASET_SPLIT]
     total_samples = len(data)
+    print(f"Total samples in dataset: {total_samples}")
     
-    # If MAX_SAMPLES is set, take a random sample
+    # Get unprocessed records first
+    unprocessed_data = [d for d in data if d['Record ID'] not in processed_ids]
+    print(f"Unprocessed samples available: {len(unprocessed_data)}")
+    
+    # If MAX_SAMPLES is set, take a random sample from UNPROCESSED data
     if Config.MAX_SAMPLES:
         random.seed(99)  # For reproducibility
-        data = random.sample(list(data), Config.MAX_SAMPLES)
-        num_samples = Config.MAX_SAMPLES
+        if len(unprocessed_data) <= Config.MAX_SAMPLES:
+            print(f"Only {len(unprocessed_data)} unprocessed samples available")
+            num_samples = len(unprocessed_data)
+            data = unprocessed_data
+        else:
+            num_samples = Config.MAX_SAMPLES
+            data = random.sample(unprocessed_data, Config.MAX_SAMPLES)
     else:
-        num_samples = total_samples
+        num_samples = len(unprocessed_data)
+        data = unprocessed_data
     
-    # Show cost estimate
+    if num_samples == 0:
+        print("All samples have been processed already!")
+        return
+        
+    print(f"Will process {num_samples} samples")
+    
+    # Show cost estimate for samples to process
     cost_estimate = estimate_cost(num_samples)
     print_cost_estimate(cost_estimate)
 
@@ -293,31 +342,29 @@ def run_benchmark():
         return
 
     gpqa_dataset = GPQADataset()
-    # Initialize model runner
     runner = ModelRunner()
-    
-    # Initialize results DataFrame with new columns
-    results_df = pd.DataFrame(columns=[
-        "record_id", "question", "correct_answer",
-        "r1_full_response", "r1_answer",
-        "claude_full_response", "claude_answer",
-        "claude_with_r1_full_response", "claude_with_r1_answer",
-        "subdomain", "high_level_domain", "difficulty"
-    ])
-    results_df.to_csv(csv_path, index=False)
     
     # Initialize metrics
     metrics = {
-        "total_samples_processed": 0,
+        "total_samples_processed": len(processed_ids),
         "errors": 0,
-        "domains": {}
+        "domains": {},
+        "cost_estimate": cost_estimate,
+        "timestamp": datetime.now().isoformat()
     }
     
+    success = True  # Track if all processing completed successfully
+    
     # Main evaluation loop
-    for idx, example in tqdm(enumerate(data), total=len(data)):
+    for question_data in tqdm(data, total=len(data)):
+        record_id = question_data['Record ID']
+        
+        if record_id in processed_ids:
+            tqdm.write(f"\nSkipping already processed record: {record_id}")
+            continue
+            
         try:
-            # Format prompt
-            prompt = gpqa_dataset.get_formatted_prompt(example)
+            prompt = gpqa_dataset.get_formatted_prompt(question_data)
             
             # Get model responses
             reasoning, r1_response = runner.get_deepseek_response(prompt)
@@ -326,55 +373,77 @@ def run_benchmark():
                 f"{prompt}\n\n<reasoning>{reasoning}</reasoning>"
             )
             
-            # Extract answers from XML tags
+            # Extract answers
             r1_answer = extract_answer(r1_response)
             claude_answer = extract_answer(claude_response)
             claude_r1_answer = extract_answer(claude_r1_response)
             
-            # Store result
+            # Create result dictionary
             result = {
-                "record_id": example['Record ID'],
-                "question": example['Question'],
-                "correct_answer": example['Correct Answer'], 
-                "r1_full_response": r1_response,
-                "r1_answer": r1_answer,
-                "claude_full_response": claude_response,
-                "claude_answer": claude_answer,
-                "claude_with_r1_full_response": claude_r1_response,
-                "claude_with_r1_answer": claude_r1_answer,
-                "subdomain": example['Subdomain'],
-                "high_level_domain": example['High-level domain'],
-                "difficulty": example["Writer's Difficulty Estimate"]
+                "record_id": record_id,
+                "question": question_data['Question'],
+                "correct_answer": question_data['Correct Answer'],
+                "correct_explanation": question_data['Explanation'],
+                "model_responses": {
+                    "deepseek": {
+                        "full_response": r1_response,
+                        "answer": r1_answer,
+                        "reasoning": reasoning,
+                        "grade": None
+                    },
+                    "claude": {
+                        "standalone": {
+                            "full_response": claude_response,
+                            "answer": claude_answer,
+                            "grade": None
+                        },
+                        "with_reasoning": {
+                            "full_response": claude_r1_response,
+                            "answer": claude_r1_answer,
+                            "grade": None
+                        }
+                    }
+                },
+                "metadata": {
+                    "subdomain": question_data['High-level domain'],
+                    "high_level_domain": question_data['High-level domain'],
+                    "difficulty": question_data["Writer's Difficulty Estimate"]
+                }
             }
-            # Update domain statistics
-            domain = example['High-level domain']
-            if domain not in metrics["domains"]:
-                metrics["domains"][domain] = 0
-            metrics["domains"][domain] += 1
             
-            # Append to CSV immediately
-            pd.DataFrame([result]).to_csv(csv_path, mode='a', header=False, index=False)
-            
-            metrics["total_samples_processed"] += 1
+            # Append single result to JSONL file
+            with open(jsonl_path, 'a') as f:
+                f.write(json.dumps(result) + '\n')
             
         except Exception as e:
             metrics["errors"] += 1
-            print(f"\nError processing example {example['Record ID']}: {str(e)}")
+            tqdm.write(f"\nError processing example {record_id}: {str(e)}")
+            success = False
             continue
-        
-        # Update metrics file
-        metrics["timestamp"] = datetime.now().isoformat()
-        with open(json_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
     
-    print(f"\nBenchmark completed!")
-    print(f"Results saved to: {csv_path}")
-    print(f"Metrics saved to: {json_path}")
-    print(f"\nProcessed {metrics['total_samples_processed']} samples")
-    print(f"Errors: {metrics['errors']}")
-    print("\nSamples by domain:")
+    # After all processing, upload entire dataset to HuggingFace
+    if success:
+        try:
+            print("\nUploading complete dataset to HuggingFace...")
+            dataset = load_dataset('json', data_files=jsonl_path)
+            dataset.push_to_hub(
+                repo_id=Config.HF_DATASET_REPO,
+                token=Config.HF_TOKEN,
+                private=False,
+                commit_message=f"Add batch of {len(data)} results"
+            )
+            print(f"✅ Successfully uploaded dataset to {Config.HF_DATASET_REPO}")
+        except Exception as e:
+            print(f"❌ Failed to upload to HuggingFace: {str(e)}")
+            print(f"💾 Data saved locally to {jsonl_path}")
+    
+    print(f"\n✅ Benchmark completed!")
+    print(f"💾 Results saved locally to: {jsonl_path}")
+    print(f"\n📊 Processed {metrics['total_samples_processed']} samples")
+    print(f"❌ Errors: {metrics['errors']}")
+    print("\n🌍 Samples by domain:")
     for domain, count in metrics["domains"].items():
-        print(f"{domain}: {count}")
+        print(f"  - {domain}: {count}")
 
 if __name__ == "__main__":
     run_benchmark()
