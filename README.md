@@ -4,6 +4,19 @@
 *Comparing Standalone vs Reasoning-Augmented LLM Approaches*
 Focused on Claude Sonnet 3.5 20241022 and DeepSeek R1
 
+## Hybrid Pipeline Benefits
+
+```mermaid
+graph LR
+    A[Raw Question] --> B(DeepSeek Reasoning)
+    B --> C[<reasoning>Chain-of-Thought</reasoning>]
+    A --> C
+    C --> D(Claude Answer)
+    D --> E[Final Response]
+    
+    style B fill:#4CAF50,stroke:#388E3C
+    style D fill:#2196F3,stroke:#1976D2
+```
 
 ![Win Rate Comparison](src/utils/analysis_results/win_rate_chart.png)
 ![Difficulty Distribution](src/utils/analysis_results/difficulty_chart.png)
@@ -150,21 +163,6 @@ Processing: 100%|██████████| 100/100 [12:45<00:00, 7.65s/it]
         "claude_sonnet_with_reasoning": 0.0417
     }
 }
-```
-
-
-## Hybrid Pipeline Benefits
-
-```mermaid
-graph LR
-    A[Raw Question] --> B(DeepSeek Reasoning)
-    B --> C[<reasoning>Chain-of-Thought</reasoning>]
-    A --> C
-    C --> D(Claude Answer)
-    D --> E[Final Response]
-    
-    style B fill:#4CAF50,stroke:#388E3C
-    style D fill:#2196F3,stroke:#1976D2
 ```
 
 ## License
