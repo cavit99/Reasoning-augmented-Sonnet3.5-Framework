@@ -4,8 +4,6 @@
 *Comparing Standalone vs Reasoning-Augmented LLM Approaches*
 Focused on Claude Sonnet 3.5 20241022 and DeepSeek R1
 
-![System Architecture](https://via.placeholder.com/800x400.png?text=Modular+Benchmark+Architecture)
-
 ## Architecture Overview
 
 ```mermaid
