@@ -4,6 +4,9 @@
 *Comparing Standalone vs Reasoning-Augmented LLM Approaches*
 Focused on Claude Sonnet 3.5 20241022 and DeepSeek R1
 
+
+![Win Rate Comparison](src/utils/win_rate_chart.png)
+![Difficulty Distribution](src/utils/difficulty_chart.png)
 ## Architecture Overview
 
 ```mermaid
