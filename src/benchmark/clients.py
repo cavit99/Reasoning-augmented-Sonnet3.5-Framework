@@ -58,6 +58,7 @@ class LLMClients:
         self.anthropic_client = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
         self.response_processor = ResponseProcessor()
         self.token_usage = TokenUsage()
+        self.last_anthropic_call = 0  # Track last API call timestamp
 
     def _update_token_usage(self, model: str, tokens: Dict[str, int]) -> None:
         """Update token usage statistics"""
@@ -70,12 +71,20 @@ class LLMClients:
         self.token_usage.by_model[model]["input"] += tokens["input"]
         self.token_usage.by_model[model]["output"] += tokens["output"]
 
-    def get_deepseek_response(self, prompt: str) -> Tuple[str, str, Dict[str, int]]:
+    def _enforce_rate_limit(self) -> None:
+        """Enforce rate limiting for Anthropic API calls"""
+        elapsed = time.time() - self.last_anthropic_call
+        if elapsed < Config.ANTHROPIC_REQUEST_DELAY:
+            sleep_time = Config.ANTHROPIC_REQUEST_DELAY - elapsed
+            time.sleep(sleep_time)
+        self.last_anthropic_call = time.time()
+
+    def get_deepseek_response(self, prompt: str, model_name: str) -> Tuple[str, str, Dict[str, int]]:
         """Get response from DeepSeek with retry logic and token tracking."""
         for attempt in range(Config.MAX_RETRIES):
             try:
                 response = self.deepseek_client.chat.completions.create(
-                    model=Config.DEEPSEEK_MODEL,
+                    model=model_name,  # Clearer parameter name
                     messages=[{"role": "user", "content": prompt}]
                 )
                 
@@ -84,7 +93,7 @@ class LLMClients:
                     "output": response.usage.completion_tokens
                 }
                 
-                self._update_token_usage(Config.DEEPSEEK_MODEL, tokens)
+                self._update_token_usage(model_name, tokens)  # Consistent naming
                 
                 return (
                     response.choices[0].message.reasoning_content or "",
@@ -97,12 +106,14 @@ class LLMClients:
                     raise
                 time.sleep(Config.RETRY_DELAY * (attempt + 1))  # Exponential backoff
 
-    def get_claude_response(self, prompt: str) -> Tuple[str, Dict[str, int]]:
+    def get_claude_response(self, prompt: str, model: str) -> Tuple[str, Dict[str, int]]:
         """Get response from Claude with retry logic and token tracking."""
+        self._enforce_rate_limit()  # Add rate limiting
+        
         for attempt in range(Config.MAX_RETRIES):
             try:
                 response = self.anthropic_client.messages.create(
-                    model=Config.CLAUDE_MODEL,
+                    model=model,  # Use dynamic model name
                     max_tokens=1024,
                     messages=[{"role": "user", "content": prompt}]
                 )
@@ -112,7 +123,7 @@ class LLMClients:
                     "output": response.usage.output_tokens
                 }
                 
-                self._update_token_usage(Config.CLAUDE_MODEL, tokens)
+                self._update_token_usage(model, tokens)  # Update token usage with dynamic model
                 
                 return (
                     response.content[0].text,

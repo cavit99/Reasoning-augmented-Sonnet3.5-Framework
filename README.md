@@ -1,112 +1,185 @@
-# ARC Challenge Model Benchmark
+# LLM Reasoning-Augmented Benchmark Framework
 
-This repository contains a benchmarking tool for evaluating Large Language Models (LLMs) on the Abstraction and Reasoning Corpus (ARC) Challenge dataset. The benchmark currently supports DeepSeek Reasoner and Anthropic's Claude models, with a unique feature to test cross-model reasoning.
+**Empirical Evaluation of Hybrid AI Architectures**  
+*Comparing Standalone vs Reasoning-Augmented LLM Approaches*
 
-## Features
+![System Architecture](https://via.placeholder.com/800x400.png?text=Modular+Benchmark+Architecture)
 
-- Evaluates multiple LLMs on ARC Challenge questions
-- Supports three evaluation modes:
-  - DeepSeek Reasoner (deepseek-reasoner)
-  - Claude 3.5 Sonnet (claude-3-5-sonnet-20241022)
-  - Claude 3.5 Sonnet with DeepSeek Reasoner's reasoning (claude-3-5-sonnet-20241022)
-- Generates detailed CSV reports and performance metrics
-- Includes retry logic for API resilience
-- Configurable sample size for testing
+## Key Features
+- 🧩 **Hybrid Pipeline** - Combine multiple LLMs in chained workflows
+- 📊 **Granular Metrics** - Token usage, cost breakdowns, and accuracy tracking
+- 🔄 **Incremental Processing** - Resume partial runs and update missing models
+- 🔍 **Data Validation** - Schema enforcement and error handling
+- 💸 **Cost Optimization** - Comparative cost/accuracy analysis
 
-## Prerequisites
+## Architecture Overview
 
-- Python 3.8+
-- API keys for:
-  - DeepSeek
-  - Anthropic
-  - Hugging Face (for dataset access)
+```mermaid
+sequenceDiagram
+    participant User
+    participant Orchestrator
+    participant LLMClients
+    participant IOManager
+    participant CostManager
 
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/arc-challenge-benchmark.git
-cd arc-challenge-benchmark
+    User->>Orchestrator: Execute Benchmark
+    Orchestrator->>IOManager: Load Dataset
+    IOManager-->>Orchestrator: Valid Records
+    Orchestrator->>CostManager: Estimate Costs
+    CostManager-->>Orchestrator: Cost Projection
+    Orchestrator->>User: Display Estimate
+    User->>Orchestrator: Confirm Execution
+    loop Process Records
+        Orchestrator->>LLMClients: Generate Responses
+        LLMClients->>DeepSeek: Reasoning Chain
+        LLMClients->>Claude: Final Answer
+        LLMClients-->>Orchestrator: Model Outputs
+        Orchestrator->>CostManager: Track Usage
+        Orchestrator->>IOManager: Save Results
+    end
+    Orchestrator->>IOManager: Consolidate Data
+    Orchestrator->>CostManager: Final Report
+    Orchestrator->>User: Benchmark Results
 ```
 
-2. Install required packages:
+## Record Processing Flow
+
+```mermaid
+graph TD
+    A[Start] --> B{Valid Record?}
+    B -->|Yes| C{Already Processed?}
+    B -->|No| H[Skip Invalid Record]
+    C -->|No| D[Process All Models]
+    C -->|Yes| E{Missing Models?}
+    E -->|Yes| F[Process Missing Models]
+    E -->|No| G[Skip]
+    D & F --> I[Save/Update Record]
+```
+
+## Installation & Configuration
+
 ```bash
+git clone https://github.com/yourusername/llm-reasoning-benchmark
+cd llm-reasoning-benchmark
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# Configure API keys
+cp .env.example .env
+nano .env  # Add DEEPSEEK_API_KEY and ANTHROPIC_API_KEY etc
 ```
 
-3. Create a `.env` file in the root directory with your API keys:
-```env
-DEEPSEEK_API_KEY=your_deepseek_key
-ANTHROPIC_API_KEY=your_anthropic_key
-HF_TOKEN=your_huggingface_token
+## Model Configuration (`config.json`)
+```json
+{
+    "models": [
+        {
+            "model_key": "deepseek_reasoner",
+            "model_name": "deepseek-reasoner",
+            "display_name": "DeepSeek R1",
+            "token_groups": [{
+                "type": "single",
+                "input": "input",
+                "output": "output"
+            }]
+        },
+        {
+            "model_key": "claude_sonnet",
+            "model_name": "claude-3-5-sonnet-20241022",
+            "token_groups": [
+                {
+                    "type": "grouped",
+                    "label": "Standalone"
+                },
+                {
+                    "type": "grouped",
+                    "label": "With Reasoning"
+                }
+            ]
+        }
+    ]
+}
 ```
 
-## Usage
+## Execution Workflow
 
-Run the benchmark:
-```bash
-python arc_challenge.py
-```
-
-To modify the number of samples or other configurations, edit the `Config` class in `arc_challenge.py`.
-
-## Output
-
-The benchmark generates two types of output files in the `benchmark_results` directory:
-
-1. CSV file (`arc_results_[timestamp].csv`):
-   - Detailed results for each question
-   - Model predictions
-   - Correctness indicators
-
-2. JSON file (`arc_metrics_[timestamp].json`):
-   - Overall accuracy metrics
-   - Total samples processed
-   - Timestamp
-
-## Configuration
-
-Key configurations in the `Config` class:
-
+1. **Dataset Preparation**
 ```python
-MAX_SAMPLES: Optional[int] = 10  # Set to None for full dataset
-DATASET_NAME: str = "ibragim-bad/arc_challenge"
-DATASET_SPLIT: str = "test"  # Options: "test", "train", "validation"
+from dataset import GPQADataset
+dataset = GPQADataset()
+prompt = dataset.get_formatted_prompt(question_data)
 ```
 
-### Dataset Splits
-The ARC Challenge dataset used contains:
-- Test: 1,119 examples (default for benchmarking)
-- Train: 1,119 examples
-- Validation: 299 examples
+2. **Run Benchmark**
+```bash
+python main.py --max-samples 100
+```
 
-By default, the benchmark:
-- Uses the test split for evaluation
-- Randomly samples 10 questions (when MAX_SAMPLES is set)
-- Uses a random seed for reproducible sampling
+3. **Sample Output**
+```
+=== Cost Estimate ===
+DeepSeek Reasoner: $0.89
+Claude Sonnet (Standalone): $2.31 
+Claude Sonnet (With Reasoning): $3.45
 
-To run on the full test set, set `MAX_SAMPLES = None` in the Config class.
+Processing: 100%|██████████| 100/100 [12:45<00:00, 7.65s/it]
+🎯 Benchmark Complete
+📦 Processed: 100 ❌ Errors: 2
+💰 Actual Costs:
+  Claude Sonnet (Standalone): $2.4123
+  Claude Sonnet (With Reasoning): $3.5021
+  Total Cost: $6.7945
+```
 
-## Models
+## Results Schema
 
-- **DeepSeek Reasoner**: Primary reasoning model
-- **Claude 3.5 Sonnet**: Secondary model
-- **Claude with Reasoning**: Claude augmented with DeepSeek's reasoning
+```json
+{
+    "record_id": "q_185",
+    "question": "What is the capital of France?",
+    "correct_answer": "Paris",
+    "metadata": {
+        "difficulty": "Hard",
+        "high_level_domain": "Geography",
+        "subdomain": "European Capitals"
+    },
+    "token_usage": {
+        "deepseek_reasoner": {"input": 154, "output": 89},
+        "claude_sonnet_standalone": {"input": 169, "output": 45},
+        "claude_sonnet_with_reasoning": {"input": 323, "output": 62}
+    },
+    "costs": {
+        "total": 0.0679,
+        "deepseek_reasoner": 0.0021,
+        "claude_sonnet_standalone": 0.0241,
+        "claude_sonnet_with_reasoning": 0.0417
+    }
+}
+```
 
-## Contributing
+## Cost Efficiency Analysis
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+| Approach | Input Tokens | Output Tokens | Cost/Q | Accuracy* |
+|----------|--------------|---------------|--------|-----------|
+| Standalone | 169 ± 12 | 347 ± 45 | $0.024 | 72% |
+| + Reasoning | 323 ± 18 | 436 ± 52 | $0.042 | 79% (+7pp) |
+
+*Example metrics from GPQA Diamond dataset
+
+## Hybrid Pipeline Benefits
+
+```mermaid
+graph LR
+    A[Raw Question] --> B(DeepSeek Reasoning)
+    B --> C[<reasoning>Chain-of-Thought</reasoning>]
+    A --> C
+    C --> D(Claude Answer)
+    D --> E[Final Response]
+    
+    style B fill:#4CAF50,stroke:#388E3C
+    style D fill:#2196F3,stroke:#1976D2
+```
 
 ## License
-
-[Your chosen license]
-
-## Acknowledgments
-
-- ARC Challenge dataset creators
-- DeepSeek team
-- Anthropic team
-
-## Disclaimer
-
-This tool is for research purposes. Please ensure you comply with all API providers' terms of service and have appropriate API access before using.
+MIT Licensed - See [LICENSE](LICENSE)  
+*Architecture designed for reproducible LLM evaluation*

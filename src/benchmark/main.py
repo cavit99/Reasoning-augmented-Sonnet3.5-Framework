@@ -1,5 +1,5 @@
 import random
-from datetime import datetime
+from tqdm import tqdm
 from typing import Dict, Any, List
 
 from .config import Config
@@ -17,63 +17,94 @@ class BenchmarkOrchestrator:
         self.dataset = GPQADataset()
         self.response_processor = ResponseProcessor()
 
-    def process_model_response(self, model_config: dict, prompt: str) -> tuple[dict, dict, float, dict]:
-        """Process responses for a single model configuration and calculate costs"""
+    def process_model_response(self, model_config: dict, prompt: str, 
+                         use_cached_reasoning: bool = False,
+                         cached_reasoning: str = None) -> tuple[dict, dict, float, dict]:
+        """Now handles cached reasoning and partial processing"""
         responses = {}
         token_usage = {}
         total_cost = 0.0
-        costs_breakdown = {}  # Track costs by group/model
+        costs_breakdown = {}
         
         model_key = model_config["model_key"]
         if "deepseek" in model_key.lower():
-            # DeepSeek specific handling
-            reasoning, response, tokens = self.clients.get_deepseek_response(prompt)
-            responses = {
-                "answer": self.response_processor.extract_answer(response),
-                "full_response": response,
-                "reasoning": reasoning,
-                "grade": None
-            }
-            token_usage = {model_key: tokens}
-            cost = self.cost_manager.calculate_cost(tokens, model_config)
-            total_cost = cost
-            costs_breakdown[model_key] = cost
+            if use_cached_reasoning:
+                # Return empty response if already processed
+                return {}, {}, 0.0, {}
+            else:
+                # Original DeepSeek processing with model_name passed from config
+                reasoning, response, tokens = self.clients.get_deepseek_response(
+                    prompt, 
+                    model_config["model_name"]  # Pass model_name from config
+                )
+                responses = {
+                    "answer": self.response_processor.extract_answer(response),
+                    "full_response": response,
+                    "reasoning": reasoning,
+                    "grade": None
+                }
+                formatted_tokens = {
+                    "input": tokens["input"],
+                    "output": tokens["output"]
+                }
+                token_usage = {model_key: formatted_tokens}
+                cost = self.cost_manager.calculate_cost(tokens, model_config)
+                total_cost = cost
+                costs_breakdown[model_key] = cost
             
         else:
+            # For Claude models using cached reasoning
+            if use_cached_reasoning and cached_reasoning:
+                # Skip DeepSeek call
+                reasoning = cached_reasoning
+                deepseek_tokens = {"input": 0, "output": 0}
+            else:
+                # Check if we already have DeepSeek reasoning
+                if "deepseek_reasoner" in responses:  
+                    reasoning = responses["deepseek_reasoner"]["reasoning"]
+                    deepseek_tokens = {"input": 0, "output": 0}  # No new call
+                else:
+                    # Original DeepSeek call
+                    reasoning, _, deepseek_tokens = self.clients.get_deepseek_response(prompt)
+
             # Claude-style handling with groups
             for group in model_config["token_groups"]:
                 if group["type"] == "grouped":
                     key = group["label"].lower().replace(" ", "_")
-                    group_key = f"{model_key}_{key}"  # Create consistent group key
                     
                     if key == "with_reasoning":
-                        reasoning, _, deepseek_tokens = self.clients.get_deepseek_response(prompt)
                         modified_prompt = f"{prompt}\n\n<reasoning>{reasoning}</reasoning>"
-                        response, tokens = self.clients.get_claude_response(modified_prompt)
+                        response, tokens = self.clients.get_claude_response(modified_prompt, model_config["model_name"])
                     else:
-                        response, tokens = self.clients.get_claude_response(prompt)
+                        response, tokens = self.clients.get_claude_response(prompt, model_config["model_name"])
                     
                     responses[key] = {
                         "answer": self.response_processor.extract_answer(response),
                         "full_response": response,
                         "grade": None
                     }
-                    token_usage[group_key] = tokens  # Use consistent group key
+                    token_usage[f"{model_key}_{key}"] = tokens  # Include model_key here for token_usage
                     group_cost = self.cost_manager.calculate_cost(tokens, model_config)
-                    costs_breakdown[group_key] = group_cost  # Store cost with consistent key
+                    costs_breakdown[f"{model_key}_{key}"] = group_cost
                     total_cost += group_cost
+                    
+                    # Track Claude's usage with correct group_key
+                    self.cost_manager.track_usage(
+                        model_config["model_key"],
+                        key,  # Pass raw group label (e.g., "with_reasoning")
+                        tokens
+                    )
         
         return responses, token_usage, total_cost, costs_breakdown
-
+    
     def prepare_result(self, question_data: Dict[str, Any], responses: Dict[str, Any],
-                      token_usage: Dict[str, Any], costs: Dict[str, float]) -> Dict[str, Any]:
+                    token_usage: Dict[str, Any], costs: Dict[str, float]) -> Dict[str, Any]:
         """Prepare the result record for storage"""
-        return {
+        result = {
             "record_id": str(question_data['Record ID']),
             "question": question_data['Question'],
             "correct_answer": question_data['Correct Answer'],
             "correct_explanation": question_data['Explanation'],
-            "model_responses": responses,
             "metadata": {
                 "difficulty": question_data.get("Writer's Difficulty Estimate", "unknown"),
                 "high_level_domain": question_data["High-level domain"],
@@ -81,61 +112,125 @@ class BenchmarkOrchestrator:
             },
             "token_usage": token_usage,
             "costs": {
-                **costs,  # Individual model/group costs
-                "total": sum(costs.values())  # Total cost for this record
+                "total": round(sum(costs.values()), 4),
+                **{k: round(v, 4) for k, v in costs.items()}
             }
         }
 
-    def process_batch(self, data: List[Dict[str, Any]], output_path: str) -> None:
-        """Process a batch of questions"""
-        batch_buffer = []
+        # Extract answers and grades to top-level fields
+        for model_key, model_data in responses.items():
+            if isinstance(model_data, dict) and "answer" in model_data:
+                # Handle non-grouped models (e.g., deepseek)
+                result[f"{model_key}_answer"] = model_data.pop("answer")
+                result[f"{model_key}_grade"] = model_data.pop("grade")
+            else:
+                # Handle grouped responses (e.g., Claude)
+                for group_key, group_data in model_data.items():
+                    result[f"{model_key}_{group_key}_answer"] = group_data.pop("answer")
+                    result[f"{model_key}_{group_key}_grade"] = group_data.pop("grade")
+
+        # Add cleaned model_responses (without answers/grades)
+        result["model_responses"] = responses
         
-        for question_data in data:
-            try:
-                prompt = self.dataset.get_formatted_prompt(question_data)
-                
-                responses = {}
-                token_usage = {}
-                costs = {}
-                
-                for model_config in self.cost_manager.model_config:
-                    model_resp, model_tokens, cost, cost_breakdown = self.process_model_response(
-                        model_config, prompt
-                    )
-                    responses[model_config["model_key"]] = model_resp
-                    token_usage.update(model_tokens)
-                    costs.update(cost_breakdown)
+        return result
+
+    def process_batch(self, data: list, output_path: str) -> None:
+        # Split into update vs new processing
+        existing_to_update, new_to_process = data
+        
+        # Process new records (full)
+        for record in tqdm(new_to_process, desc="New records"):
+            self._process_full_record(record, output_path)
+        
+        # Update existing records (partial)
+        for record_data in tqdm(existing_to_update, desc="Updating existing"):
+            self._update_existing_record(
+                record_data['base_data'],
+                record_data['existing'],
+                record_data['missing_models'],
+                output_path
+            )
+
+    def _update_existing_record(self, base_data, existing_record, missing_models, output_path):
+        """Add missing models to existing record"""
+        try:
+            # Reuse cached DeepSeek reasoning if available
+            cached_reasoning = existing_record.get('deepseek_reasoner_reasoning')
+            prompt = self.dataset.get_formatted_prompt(base_data)
+            
+            # Process only missing models
+            for model_config in self.cost_manager.model_config:
+                if model_config["model_key"] not in missing_models:
+                    continue
                     
-                    if "deepseek" in model_config["model_key"].lower():
-                        self.cost_manager.track_usage(
-                            model_key=model_config["model_key"],
-                            group_key="base",  
-                            tokens=model_tokens
-                        )
-                    else:
-                        for group_key, tokens in model_tokens.items():
-                            self.cost_manager.track_usage(model_config["model_key"], group_key, tokens)
-
-                result = self.prepare_result(question_data, responses, token_usage, costs)
+                # Modified process_model_response that skips existing work
+                model_resp, model_tokens, cost, cost_breakdown = self.process_model_response(
+                    model_config, 
+                    prompt,
+                    use_cached_reasoning=True,
+                    cached_reasoning=cached_reasoning
+                )
                 
-                # Update metrics and save result
-                self.cost_manager.increment_processed()
-                self.cost_manager.update_domain_stats(question_data['High-level domain'])
-                self.io_manager.save_result(result, output_path)
+                # Merge new data into existing record
+                updated_record = self._merge_responses(
+                    existing_record,
+                    model_config["model_key"],
+                    model_resp,
+                    model_tokens,
+                    cost_breakdown
+                )
                 
-                # Batch upload handling
-                batch_buffer.append(result)
-                if len(batch_buffer) >= Config.BATCH_SIZE:
-                    self.io_manager.upload_to_huggingface(output_path, len(batch_buffer))
-                    batch_buffer = []
+                # Save updated record
+                self.io_manager.save_updated_record(updated_record, output_path)
 
-            except Exception as e:
-                self.cost_manager.increment_errors()
-                print(f"Error processing {question_data['Record ID']}: {str(e)}")
+        except Exception as e:
+            self.cost_manager.increment_errors()
+            print(f"Error updating record {base_data['Record ID']}: {str(e)}")
 
-        # Upload remaining records in buffer
-        if batch_buffer:
-            self.io_manager.upload_to_huggingface(output_path, len(batch_buffer))
+    def _process_full_record(self, record: Dict[str, Any], output_path: str) -> None:
+        """Process a new record with all models"""
+        try:
+            prompt = self.dataset.get_formatted_prompt(record)
+            
+            responses = {}
+            token_usage = {}
+            costs = {}
+            
+            for model_config in self.cost_manager.model_config:
+                model_resp, model_tokens, cost, cost_breakdown = self.process_model_response(
+                    model_config, prompt
+                )
+                responses[model_config["model_key"]] = model_resp
+                token_usage.update(model_tokens)
+                costs.update(cost_breakdown)
+                
+            result = self.prepare_result(record, responses, token_usage, costs)
+            self.io_manager.save_result(result, output_path)
+            
+        except Exception as e:
+            self.cost_manager.increment_errors()
+            print(f"Error processing new record {record['Record ID']}: {str(e)}")
+
+    def _merge_responses(self, existing: dict, model_key: str, 
+                    new_responses: dict, tokens: dict, costs: dict) -> dict:
+        """Merge new model responses into existing record"""
+        merged = existing.copy()
+        
+        # Update answers
+        for key, value in new_responses.items():
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    merged[f"{model_key}_{key}_{subkey}"] = subvalue
+            else:
+                merged[f"{model_key}_{key}"] = value
+                
+        # Update tokens and costs
+        merged["token_usage"].update(tokens)
+        merged["costs"].update({k: round(v, 4) for k, v in costs.items()})
+        merged["costs"]["total"] = round(sum(merged["costs"].values()), 4)
+        
+        return merged
+
 
     def run(self):
         """Main benchmark execution flow"""
@@ -144,12 +239,6 @@ class BenchmarkOrchestrator:
         
         if not data:
             print("All samples already processed! No new API calls needed.")
-            
-            # Optionally try to consolidate and upload existing results
-            consolidated_path = self.io_manager.consolidate_jsonl_files()
-            if consolidated_path:
-                print("\nAttempting to upload consolidated results to HuggingFace...")
-                self.io_manager.upload_to_huggingface(consolidated_path, len(self.io_manager.get_processed_record_ids()))
             return
 
         # Sample data if MAX_SAMPLES is set
@@ -169,10 +258,10 @@ class BenchmarkOrchestrator:
         output_path = Config.get_output_path()
         self.process_batch(data, output_path)
 
-        # Consolidate and upload final results
+        # Consolidate results after processing
         consolidated_path = self.io_manager.consolidate_jsonl_files()
         if consolidated_path:
-            self.io_manager.upload_to_huggingface(consolidated_path, self.cost_manager.metrics.processed)
+            print(f"\nConsolidated results saved to: {consolidated_path}")
 
         # Print final report
         self.cost_manager.print_final_report()

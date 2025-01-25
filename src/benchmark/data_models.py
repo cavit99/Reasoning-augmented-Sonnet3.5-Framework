@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Union, Type
 import json
+import os
 
 @dataclass
 class SchemaField:
@@ -40,7 +41,11 @@ class SchemaManager:
     def _get_config() -> Dict[str, Any]:
         """Load model config from JSON file"""
         try:
-            with open("config.json") as f:
+            # Get the root directory by going up two levels from the current file
+            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            config_path = os.path.join(root_dir, "config.json")
+            
+            with open(config_path) as f:
                 config = json.load(f)
                 if "models" not in config:
                     raise ValueError("Invalid config.json: missing 'models' key")
@@ -52,9 +57,8 @@ class SchemaManager:
 
     @staticmethod
     def get_record_schema() -> Dict[str, Union[SchemaField, Dict[str, Any]]]:
-        """Central definition of the record schema"""
         models = SchemaManager._get_config()
-        return {
+        schema: Dict[str, Any] = {
             "record_id": SchemaField(str),
             "question": SchemaField(str),
             "correct_answer": SchemaField(str),
@@ -77,8 +81,33 @@ class SchemaManager:
             "token_usage": {
                 "type": "nested",
                 "structure": SchemaManager.get_token_usage_structure()
+            },
+            "costs": { 
+                "type": "nested",
+                "structure": {
+                    "total": SchemaField(float),
+                    **{
+                        f"{model['model_key']}_{group['label'].lower().replace(' ', '_')}"
+                        if group["type"] == "grouped" else model['model_key']: SchemaField(float)
+                        for model in models 
+                        for group in model["token_groups"]
+                    }
+                }
             }
         }
+
+        # Add top-level answer and grade fields for all models/groups
+        for model in models:
+            for group in model["token_groups"]:
+                if group["type"] == "grouped":
+                    key_suffix = f"{model['model_key']}_{group['label'].lower().replace(' ', '_')}"
+                    schema[f"{key_suffix}_answer"] = SchemaField(str)
+                    schema[f"{key_suffix}_grade"] = SchemaField(type(None))
+                else:
+                    schema[f"{model['model_key']}_answer"] = SchemaField(str)
+                    schema[f"{model['model_key']}_grade"] = SchemaField(type(None))
+        
+        return schema
 
     @staticmethod
     def get_model_response_structure(model_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -87,31 +116,32 @@ class SchemaManager:
             if group["type"] == "grouped":
                 key = group["label"].lower().replace(" ", "_")
                 structure[key] = {
-                    "answer": SchemaField(str),
-                    "full_response": SchemaField(str),
-                    "grade": SchemaField(type(None))
+                    "full_response": SchemaField(str)
                 }
             else:
                 structure.update({
-                    "answer": SchemaField(str),
                     "full_response": SchemaField(str),
-                    "reasoning": SchemaField(str),
-                    "grade": SchemaField(type(None))
+                    "reasoning": SchemaField(str)  
                 })
         return structure
 
     @staticmethod
     def get_token_usage_structure() -> Dict[str, Dict[str, SchemaField]]:
-        structure: Dict[str, Dict[str, SchemaField]] = {}
+        structure = {}
         for model in SchemaManager._get_config():
+            model_key = model["model_key"]
             for group in model["token_groups"]:
-                key = f"{model['model_key']}"
                 if group["type"] == "grouped":
-                    key += f"_{group['label'].lower().replace(' ', '_')}"
-                structure[key] = {
-                    "input": SchemaField(int),
-                    "output": SchemaField(int)
-                }
+                    group_key = f"{model_key}_{group['label'].lower().replace(' ', '_')}"
+                    structure[group_key] = {
+                        "input": SchemaField(int),
+                        "output": SchemaField(int)
+                    }
+                else:
+                    structure[model_key] = {
+                        "input": SchemaField(int),
+                        "output": SchemaField(int)
+                    }
         return structure
 
     @staticmethod
@@ -141,4 +171,14 @@ class SchemaManager:
                 
             return False
         
-        return check_structure(record, schema)
+        # Check all top-level fields
+        for key, schema_field in schema.items():
+            if key not in ["model_responses", "metadata", "token_usage", "costs"]:
+                if not check_structure(record.get(key), schema_field):
+                    return False
+        
+        # Check nested structures
+        return check_structure(record.get("model_responses"), schema["model_responses"]) and \
+               check_structure(record.get("metadata"), schema["metadata"]) and \
+               check_structure(record.get("token_usage"), schema["token_usage"]) and \
+               check_structure(record.get("costs"), schema["costs"])

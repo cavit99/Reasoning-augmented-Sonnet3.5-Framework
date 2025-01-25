@@ -1,10 +1,9 @@
 import json
 import os
-import time
 from typing import Optional, Set, List, Dict, Any
 
-from datasets import load_dataset, Features, Value, Dataset, concatenate_datasets
-
+from datasets import load_dataset
+from .cost_manager import CostManager
 from .config import Config
 from .data_models import SchemaField, SchemaManager
 
@@ -79,72 +78,81 @@ class IOManager:
                 f.write(json.dumps(res) + '\n')
                 
         return consolidated_path
+    
+    def load_existing_results(self) -> Dict[str, Dict[str, Any]]:
+        """Load all existing results into a dictionary by record_id"""
+        existing = {}
+        consolidated_path = os.path.join(Config.RESULTS_DIR, "consolidated.jsonl")
+        
+        if os.path.exists(consolidated_path):
+            with open(consolidated_path) as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        existing[record["record_id"]] = record
+                    except json.JSONDecodeError:
+                        continue
+        return existing
 
     def save_result(self, result: Dict[str, Any], output_path: str) -> None:
         """Save a single result to the output file."""
         with open(output_path, 'a') as f:
             f.write(json.dumps(result) + '\n')
 
-    def upload_to_huggingface(self, jsonl_path: str, num_records: int) -> None:
-        """Upload results with dynamic schema generation."""
-        def build_features(schema_node):
-            if isinstance(schema_node, SchemaField):
-                return Value(schema_node.hf_type)
-            if isinstance(schema_node, dict):
-                if "type" in schema_node and schema_node["type"] == "nested":
-                    return {k: build_features(v) for k, v in schema_node["structure"].items()}
-                return {k: build_features(v) for k, v in schema_node.items()}
-            return schema_node
-        
-        schema = self.schema_manager.get_record_schema()
-        features = Features(build_features(schema))
-        
-        # Load existing dataset with retry
-        existing_ds = None
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                existing_ds = load_dataset(Config.HF_DATASET_REPO, split="train")
-                break
-            except Exception as e:
-                if attempt == Config.MAX_RETRIES - 1:
-                    print(f"Warning: Could not load existing dataset: {str(e)}")
-                time.sleep(Config.RETRY_DELAY * (attempt + 1))
-
-        # Load and upload new dataset with retry
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                new_ds = load_dataset('json', data_files=jsonl_path, features=features, split='train')
-                combined_ds = concatenate_datasets([existing_ds, new_ds]) if existing_ds else new_ds
-                
-                combined_ds.push_to_hub(
-                    repo_id=Config.HF_DATASET_REPO,
-                    token=os.getenv('HF_TOKEN'),
-                    private=False,
-                    commit_message=f"Add batch of {num_records} results"
-                )
-                print(f"✅ Uploaded {num_records} new records to {Config.HF_DATASET_REPO}")
-                break
-            except Exception as e:
-                if attempt == Config.MAX_RETRIES - 1:
-                    print(f"❌ Upload failed: {str(e)}")
-                    raise
-                print(f"Retrying upload after error: {str(e)}")
-                time.sleep(Config.RETRY_DELAY * (attempt + 1))
-
-    def load_dataset(self) -> List[Dict[str, Any]]:
-        """Load and prepare the dataset for processing."""
+    def load_dataset(self) -> tuple[list, list]:
+        """Returns (existing_records_to_update, new_records_to_process)"""
         processed_ids = self.get_processed_record_ids()
-        print(f"Found {len(processed_ids)} processed records")
+        existing_records = self.load_existing_records()  # New method
+        
+        # Load fresh dataset
+        dataset = load_dataset(Config.DATASET_NAME, "gpqa_diamond", token=os.getenv('HF_TOKEN'))
+        all_data = dataset[Config.DATASET_SPLIT]
+        
+        # Separate existing and new
+        existing_to_update = []
+        new_to_process = []
+        
+        for record in all_data:
+            record_id = str(record['Record ID'])
+            if record_id in processed_ids:
+                # Check which models are missing
+                existing = existing_records.get(record_id, {})
+                missing_models = self._get_missing_models(existing)
+                if missing_models:
+                    existing_to_update.append({
+                        'base_data': record,
+                        'existing': existing,
+                        'missing_models': missing_models
+                    })
+            else:
+                new_to_process.append(record)
+        
+        return existing_to_update, new_to_process
 
-        # Load and filter dataset with retry
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                dataset = load_dataset(Config.DATASET_NAME, "gpqa_diamond", token=os.getenv('HF_TOKEN'))
-                data = [d for d in dataset[Config.DATASET_SPLIT] if d['Record ID'] not in processed_ids]
-                print(f"Found {len(data)} unprocessed records")
-                return data
-            except Exception as e:
-                if attempt == Config.MAX_RETRIES - 1:
-                    raise ValueError(f"Failed to load dataset after {Config.MAX_RETRIES} attempts: {str(e)}")
-                print(f"Retrying dataset load after error: {str(e)}")
-                time.sleep(Config.RETRY_DELAY * (attempt + 1))
+    def _get_missing_models(self, existing_record: dict) -> list:
+        """Identify models not present in existing record"""
+        expected_models = {m['model_key'] for m in CostManager().model_config}
+        present_models = set()
+        
+        for key in existing_record.keys():
+            if '_answer' in key:
+                model = key.split('_')[0]
+                present_models.add(model)
+        
+        return list(expected_models - present_models)
+
+    def save_updated_record(self, updated_record: dict, output_path: str) -> None:
+        """Update existing record in-place"""
+        temp_path = output_path + ".tmp"
+        
+        with open(output_path, 'r') as old_file, open(temp_path, 'w') as new_file:
+            for line in old_file:
+                record = json.loads(line)
+                if record['record_id'] == updated_record['record_id']:
+                    # Merge updates
+                    merged = {**record, **updated_record}
+                    new_file.write(json.dumps(merged) + '\n')
+                else:
+                    new_file.write(line)
+        
+        os.replace(temp_path, output_path)

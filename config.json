@@ -2,7 +2,8 @@
     "models": [
         {
             "model_key": "deepseek_reasoner",
-            "display_name": "DeepSeek Reasoner",
+            "model_name": "deepseek-reasoner",
+            "display_name": "DeepSeek R1",
             "token_groups": [
                 {
                     "type": "single",
@@ -15,37 +16,62 @@
                 "output": 7441
             },
             "cost_per_million": {
-                "input": 0.14,
+                "input": 0.55,
                 "output": 2.19
             }
         },
         {
             "model_key": "claude_sonnet",
+            "model_name": "claude-3-5-sonnet-20241022",
             "display_name": "Claude Sonnet 3.5 20241022",
             "token_groups": [
                 {
                     "type": "grouped",
                     "label": "Standalone",
-                    "input": "standalone_input",
-                    "output": "standalone_output"
+                    "input": "input",
+                    "output": "output"
                 },
                 {
                     "type": "grouped",
                     "label": "With Reasoning",
-                    "input": "with_reasoning_input",
-                    "output": "with_reasoning_output"
+                    "input": "input",
+                    "output": "output"
                 }
             ],
             "tokens": {
-                "standalone_input": 169,
-                "standalone_output": 347,
-                "with_reasoning_input": 7191,
-                "with_reasoning_output": 228
+                "input": 169,
+                "output": 347
             },
             "cost_per_million": {
                 "input": 3.00,
                 "output": 15.00
             }
+        },
+        {
+            "model_key": "claude_haiku",
+            "model_name": "claude-3-5-haiku-20241022",
+            "display_name": "Claude Haiku 3.5 20241022",
+            "token_groups": [
+                {
+                    "type": "grouped",
+                    "label": "Standalone",
+                    "input": "input",
+                    "output": "output"
+                },
+                {
+                    "type": "grouped",
+                    "label": "With Reasoning",
+                    "input": "input",
+                    "output": "output"
+                }
+            ],
+            "tokens": {
+                "input": 169, 
+                "output": 347
+            },
+            "cost_per_million": {
+                "input": 0.8, 
+                "output": 4
+            }
         }
-    ]
-}
+    ]}

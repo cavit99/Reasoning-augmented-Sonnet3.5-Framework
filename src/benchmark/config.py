@@ -9,21 +9,21 @@ class Config:
     ENV_FILE = ".env"
     CONFIG_FILE = "config.json"
     
+    # Debug settings
+    DEBUG_MODE = True
+    
+    # Rate limiting (Anthropic's documented limits)
+    ANTHROPIC_RPM = 50                 # Requests per minute
+    ANTHROPIC_ITPM = 50000             # Input tokens per minute
+    ANTHROPIC_OTPM = 10000             # Output tokens per minute
+    ANTHROPIC_REQUEST_DELAY = 1.2      # 60/RPM = 1.2s between requests
+    
     # Application constants
-    MAX_SAMPLES = 1  # Set to None to run on all samples
-    DATASET_NAME = "iDavidRein/gpqa"
-    DATASET_SPLIT = "train"  # Only split available in GPQA
+    MAX_SAMPLES = None  # Set to None to run on all samples
     RESULTS_DIR = "benchmark_results"
     BATCH_SIZE = 100  # Number of samples per HuggingFace upload
     MAX_RETRIES = 3
     RETRY_DELAY = 2
-    
-    # Model configuration
-    DEEPSEEK_MODEL = "deepseek-reasoner"
-    CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
-    
-    # Dataset configuration
-    HF_DATASET_REPO = "spawn99/GPQA-diamond-ClaudeR1"
     
     @classmethod
     def _validate_config_json(cls) -> Dict[str, Any]:
@@ -89,7 +89,12 @@ class Config:
     
     @staticmethod
     def get_output_path() -> str:
-        """Generate standardized output path for results."""
+        """Generate path using actual model names from config.json"""
+        models = [m["model_name"] for m in Config._validate_config_json()["models"]]
+        model_str = "_".join(models)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"arc__deepseek-{Config.DEEPSEEK_MODEL}__claude-{Config.CLAUDE_MODEL}__{timestamp}"
-        return os.path.join(Config.RESULTS_DIR, f"{base_name}.jsonl")
+        return os.path.join(Config.RESULTS_DIR, f"benchmark_{model_str}_{timestamp}.jsonl")
+
+    @classmethod
+    def get_model_configs(cls) -> list:
+        return cls._validate_config_json()["models"]

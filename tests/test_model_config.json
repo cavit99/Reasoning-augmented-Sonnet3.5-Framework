@@ -1,0 +1,51 @@
+{
+    "models": [
+        {
+            "model_key": "deepseek_reasoner",
+            "display_name": "DeepSeek Reasoner",
+            "token_groups": [
+                {
+                    "type": "single",
+                    "input": "input",
+                    "output": "output"
+                }
+            ],
+            "tokens": {
+                "input": 154,
+                "output": 7441
+            },
+            "cost_per_million": {
+                "input": 0.14,
+                "output": 2.19
+            }
+        },
+        {
+            "model_key": "claude_sonnet",
+            "display_name": "Claude Sonnet",
+            "token_groups": [
+                {
+                    "type": "grouped",
+                    "label": "Standalone",
+                    "input": "standalone_input",
+                    "output": "standalone_output"
+                },
+                {
+                    "type": "grouped",
+                    "label": "With Reasoning",
+                    "input": "with_reasoning_input",
+                    "output": "with_reasoning_output"
+                }
+            ],
+            "tokens": {
+                "standalone_input": 169,
+                "standalone_output": 347,
+                "with_reasoning_input": 7191,
+                "with_reasoning_output": 228
+            },
+            "cost_per_million": {
+                "input": 3.00,
+                "output": 15.00
+            }
+        }
+    ]
+} 
