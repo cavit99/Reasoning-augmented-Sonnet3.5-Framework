@@ -9,3 +9,4 @@ explore-output-dataset.py
 .DS_Store
 backup/
 .example.response
+_DS_Store
