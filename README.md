@@ -2,15 +2,9 @@
 
 **Empirical Evaluation of Hybrid AI Architectures**  
 *Comparing Standalone vs Reasoning-Augmented LLM Approaches*
+Focused on Claude Sonnet 3.5 20241022 and DeepSeek R1
 
 ![System Architecture](https://via.placeholder.com/800x400.png?text=Modular+Benchmark+Architecture)
-
-## Key Features
-- 🧩 **Hybrid Pipeline** - Combine multiple LLMs in chained workflows
-- 📊 **Granular Metrics** - Token usage, cost breakdowns, and accuracy tracking
-- 🔄 **Incremental Processing** - Resume partial runs and update missing models
-- 🔍 **Data Validation** - Schema enforcement and error handling
-- 💸 **Cost Optimization** - Comparative cost/accuracy analysis
 
 ## Architecture Overview
 
@@ -157,14 +151,6 @@ Processing: 100%|██████████| 100/100 [12:45<00:00, 7.65s/it]
 }
 ```
 
-## Cost Efficiency Analysis
-
-| Approach | Input Tokens | Output Tokens | Cost/Q | Accuracy* |
-|----------|--------------|---------------|--------|-----------|
-| Standalone | 169 ± 12 | 347 ± 45 | $0.024 | 72% |
-| + Reasoning | 323 ± 18 | 436 ± 52 | $0.042 | 79% (+7pp) |
-
-*Example metrics from GPQA Diamond dataset
 
 ## Hybrid Pipeline Benefits
 
